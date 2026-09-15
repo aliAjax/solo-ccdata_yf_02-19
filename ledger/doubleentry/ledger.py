@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import date as _date
 from decimal import Decimal
@@ -145,9 +146,19 @@ class Ledger:
     # ---------- 构造 ----------
 
     SCHEMA_VERSION = "2"  # v2：审计链/快照链带链头锚点；v1 账本打开时安全迁移
+    MANIFEST_VERSION = "1"  # 纯主数据旧链的外部终点证据（链尾清单）格式版本
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, tail_manifest_path: str | None = "auto"):
+        """打开既有账本。
+
+        ``tail_manifest_path`` 控制纯主数据 v1 旧链（没有凭证/快照可交叉验证）
+        的额外终点证据：
+        * ``"auto"``（默认）：在账本同目录寻找 ``<账本文件名>.tail.json``；
+        * 显式路径：读取该文件作为证据；
+        * ``None``：不接受任何外部证据，纯主数据旧链将被阻断。
+        """
         self.path = path
+        self.tail_manifest_path = tail_manifest_path
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
@@ -167,6 +178,7 @@ class Ledger:
     def create(cls, path: str, base_currency: str = "CNY", base_precision: int = 2):
         db = cls.__new__(cls)
         db.path = path
+        db.tail_manifest_path = "auto"
         db.conn = sqlite3.connect(path)
         db.conn.row_factory = sqlite3.Row
         db.conn.execute("PRAGMA foreign_keys=ON")
@@ -1274,6 +1286,90 @@ class Ledger:
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
+    # ----- 纯主数据旧链的外部"完整终点证据" -----
+
+    def _tail_manifest_path(self) -> str | None:
+        """解析链尾清单文件路径。None 表示不接受外部证据。"""
+        setting = getattr(self, "tail_manifest_path", "auto")
+        if setting is None:
+            return None
+        if setting == "auto":
+            return self.path + ".tail.json"
+        return setting
+
+    def _load_tail_manifest(self) -> dict | None:
+        """读取外部链尾清单；文件不存在返回 None；内容损坏直接判证据无效。"""
+        path = self._tail_manifest_path()
+        if path is None or not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as exc:
+            raise ConsistencyError(
+                f"链尾终点证据文件 {path} 无法读取或解析（{exc}），拒绝迁移"
+            )
+        if not isinstance(data, dict) or data.get("manifest_version") != self.MANIFEST_VERSION:
+            raise ConsistencyError(
+                f"链尾终点证据文件 {path} 格式或版本不受支持（需要 "
+                f"manifest_version={self.MANIFEST_VERSION}），拒绝迁移"
+            )
+        return data
+
+    def _legacy_tail_evidence(self, audit_rows, snap_rows, audit_tail, snap_tail) -> dict:
+        """判定 v1 旧链"链尾完整性"由什么证据支撑。
+
+        * 链为空：无需证据；
+        * 现存末条审计是凭证过账或关账（业务表能逐条交叉验证到该事件）：
+          业务交叉证据已足够；
+        * 末条落在主数据/配置/汇率/反结账等事件上（包括完全没有凭证与快照的
+          **纯主数据旧链**）：业务表无法证明"这就是最后一条"，必须出示外部
+          链尾清单（审计条数 + 末条哈希，快照同理）；缺失或不符一律阻断。
+        """
+        if not audit_rows:
+            return {"type": "empty"}
+
+        last_documented = self.conn.execute(
+            "SELECT MAX(id) m FROM audit_log WHERE action IN ('voucher.post','period.close')"
+        ).fetchone()["m"]
+        last_id = audit_rows[-1]["id"]
+        if last_documented is not None and last_documented == last_id:
+            return {"type": "business_cross_check"}
+
+        # 末条事件没有业务单据可交叉验证 → 必须提供额外的完整终点证据
+        path = self._tail_manifest_path()
+        where = f"（应位于 {path}）" if path else "（当前已禁用外部证据 tail_manifest_path=None）"
+        manifest = self._load_tail_manifest()
+        if manifest is None:
+            raise ConsistencyError(
+                "旧审计链末条是主数据/配置类事件，库中没有凭证或快照可交叉验证链尾，"
+                f"必须提供额外的完整终点证据（链尾清单）{where}；缺少证据，拒绝迁移"
+            )
+
+        expected = {
+            "manifest_version": self.MANIFEST_VERSION,
+            "audit_count": len(audit_rows),
+            "audit_tail_hash": audit_tail,
+            "snapshot_count": len(snap_rows),
+            "snapshot_tail_hash": snap_tail,
+        }
+        mismatches: list[str] = []
+        for key, want in expected.items():
+            got = manifest.get(key)
+            if got != want:
+                mismatches.append(f"{key}: 证据={got!r}，实际={want!r}")
+        if mismatches:
+            raise ConsistencyError(
+                "链尾终点证据与现存账本不符，无法证明链尾完整（末条记录疑似缺失或被改写），"
+                "拒绝迁移；不符项 → " + "；".join(mismatches)
+            )
+        return {
+            "type": "tail_manifest",
+            "path": path,
+            "audit_count": len(audit_rows),
+            "snapshot_count": len(snap_rows),
+        }
+
     def _ensure_anchors(self) -> dict:
         """保证两条链都有链头锚点；v1 旧账本在这里做一次性安全迁移。
 
@@ -1301,11 +1397,19 @@ class Ledger:
         with self.conn:
             # v1 旧账本：先用业务表交叉证据证明"没有审计记录被抹掉"，
             # 再证明两条哈希链连续；任一不过直接阻断，绝不写入锚点。
+            tail_evidence = {"type": "n/a"}
             if legacy:
                 self._audit_business_evidence()
 
             # 审计链
             audit_rows, audit_tail = self._audit_tail()
+            snap_rows, snap_tail = self._snapshot_tail()
+            if legacy:
+                # 交叉证据覆盖不到的纯主数据链尾，要求出示额外的完整终点证据
+                tail_evidence = self._legacy_tail_evidence(
+                    audit_rows, snap_rows, audit_tail, snap_tail
+                )
+
             audit_anchor = self._meta("audit_head")
             if audit_anchor is not None:
                 self._check_anchor("audit_head", audit_anchor, audit_rows, audit_tail,
@@ -1322,7 +1426,6 @@ class Ledger:
             # 无锚点且链为空 = 尚未发生写入的全新账本，合法
 
             # 快照链（用同一事务，保证两条链一起迁移或一起不动）
-            snap_rows, snap_tail = self._snapshot_tail()
             snap_anchor = self._meta("snapshot_head")
             if snap_anchor is not None:
                 self._check_anchor("snapshot_head", snap_anchor, snap_rows, snap_tail,
@@ -1347,13 +1450,15 @@ class Ledger:
                 self._audit(
                     "schema.migrate",
                     None,
-                    {"from": "1", "to": self.SCHEMA_VERSION, "anchors": migrated},
+                    {"from": "1", "to": self.SCHEMA_VERSION,
+                     "anchors": migrated, "tail_evidence": tail_evidence},
                 )
                 new_tail = self.conn.execute(
                     "SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1"
                 ).fetchone()["hash"]
                 adopt("audit_head", new_tail)
-        return {"migrated": bool(migrated), "legacy": legacy, "anchors": migrated}
+        return {"migrated": bool(migrated), "legacy": legacy, "anchors": migrated,
+                "tail_evidence": tail_evidence}
 
     def _check_anchor(self, key: str, anchor, rows, tail: str | None, *, kind: str) -> None:
         label = "审计记录" if kind == "audit" else "关账快照"

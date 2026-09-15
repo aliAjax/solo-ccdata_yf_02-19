@@ -32,7 +32,10 @@ def _db_path(args) -> str:
 
 
 def _open(args) -> Ledger:
-    return Ledger(_db_path(args))
+    manifest = getattr(args, "tail_manifest", "auto")
+    if manifest == "none":
+        manifest = None
+    return Ledger(_db_path(args), tail_manifest_path=manifest)
 
 
 def _money(v: Decimal) -> str:
@@ -284,6 +287,12 @@ def cmd_equation(args):
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="离线复式记账与期末关账台")
     p.add_argument("--db", help="SQLite 账本路径（也可用 LEDGER_DB 环境变量）")
+    p.add_argument(
+        "--tail-manifest",
+        default="auto",
+        help="纯主数据旧账本迁移所需的链尾终点证据文件；默认 auto 自动查找 "
+             "<账本>.tail.json，传 none 表示禁用外部证据（此类旧账本将被阻断）",
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
     sp = sub.add_parser("init", help="创建账本")

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import sys
 import tempfile
@@ -768,6 +769,175 @@ def main() -> int:
     check(fb3.conn.execute("SELECT COUNT(*) c FROM audit_log").fetchone()["c"] >= 5,
           "全新账本第三次打开一切正常（init/2 主数据/过账审计完整）")
     fb3.close()
+
+    section("7C. 纯主数据旧链：无凭证/快照交叉验证，必须出示外部完整终点证据")
+
+    def build_master_only_legacy(name: str) -> str:
+        """只有主数据/汇率配置审计、没有任何凭证或快照的 v1 旧账本。"""
+        path = os.path.join(tmp, name)
+        b = Ledger.create(path)
+        b.add_currency("USD", "美元", 2)
+        b.add_subject("1002", "银行存款", "D")
+        b.add_subject("4001", "实收资本", "C")
+        b.add_account("usd", "美元户", "1002", "USD")
+        b.set_rate("USD", "2026-01-05", "7.10")
+        b.close()
+        assert os.path.exists(path)
+        # 确认库中确实没有任何凭证/快照可交叉验证
+        raw = sqlite3.connect(path)
+        assert raw.execute("SELECT COUNT(*) FROM voucher").fetchone()[0] == 0
+        assert raw.execute("SELECT COUNT(*) FROM period_snapshot").fetchone()[0] == 0
+        n_audit = raw.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+        tail = raw.execute("SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()[0]
+        raw.execute("DELETE FROM meta WHERE key IN ('audit_head','snapshot_head','schema_version')")
+        raw.commit()
+        raw.close()
+        return path, n_audit, tail
+
+    def write_tail_manifest(path: str, n_audit: int, tail: str):
+        manifest = {
+            "manifest_version": Ledger.MANIFEST_VERSION,
+            "audit_count": n_audit,
+            "audit_tail_hash": tail,
+            "snapshot_count": 0,
+            "snapshot_tail_hash": None,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False)
+
+    # --- 完整链：无证据阻断；提供与链尾一致的证据后迁移成功 ---
+    p1, n1, tail1 = build_master_only_legacy("master-legacy.db")
+    expect_error(ConsistencyError, lambda: Ledger(p1, tail_manifest_path=None),
+                 "纯主数据旧链无交叉验证、禁用外部证据：阻断", contains="完整终点证据")
+    # 默认 auto 查找 <path>.tail.json，文件不存在同样阻断
+    expect_error(ConsistencyError, lambda: Ledger(p1),
+                 "纯主数据旧链缺少链尾清单文件：阻断", contains="完整终点证据")
+    # 阻断时不留锚点、不置版本号、不写迁移记录
+    raw = sqlite3.connect(p1)
+    check(raw.execute("SELECT COUNT(*) FROM meta WHERE key='audit_head'").fetchone()[0] == 0
+          and raw.execute("SELECT COUNT(*) FROM audit_log WHERE action='schema.migrate'")
+              .fetchone()[0] == 0,
+          "证据缺失阻断时账本保持原样（无锚点/无迁移记录）")
+    raw.close()
+
+    # 提供正确的完整终点证据（auto 发现路径）
+    write_tail_manifest(p1 + ".tail.json", n1, tail1)
+    mb = Ledger(p1)
+    _, post_tail = mb._audit_tail()
+    mig_hash = mb.conn.execute(
+        "SELECT hash FROM audit_log WHERE action='schema.migrate'"
+    ).fetchone()["hash"]
+    check(mb._meta("schema_version") == Ledger.SCHEMA_VERSION
+          and mb._meta("audit_head") == post_tail == mig_hash
+          and mb.conn.execute("SELECT 1 FROM audit_log WHERE hash=?", (tail1,)).fetchone(),
+          "证据齐全：纯主数据旧链完成迁移；证据验证旧链尾，锚点推进到迁移记录")
+    mig = mb.conn.execute(
+        "SELECT detail_json FROM audit_log WHERE action='schema.migrate'"
+    ).fetchone()
+    check(mig is not None and '"tail_manifest"' in mig[0],
+          "迁移留痕记录所采用的证据类型（tail_manifest）")
+    mb.verify_all()
+    # 迁移后正常过账（补上必要账户）、重估、关账
+    mb.add_subject("6701", "汇兑损益", "D")
+    mb.add_account("gl", "汇兑损益户", "6701", "CNY")
+    mb.configure_fx("6701", "gl")
+    mb.add_account("cap", "资本户", "4001", "CNY")
+    mb.add_account("cny", "人民币户", "1002", "CNY")
+    mb.post_voucher("2026-01-02",
+                    [{"account": "cny", "currency": "CNY", "debit": "71000", "credit": "0"},
+                     {"account": "cap", "currency": "CNY", "debit": "0", "credit": "71000"}],
+                    memo="迁移后业务")
+    mb.post_voucher("2026-01-05",
+                    [{"account": "usd", "currency": "USD", "debit": "10000", "credit": "0"},
+                     {"account": "cny", "currency": "CNY", "debit": "0", "credit": "71000"}],
+                    memo="购汇")
+    mb.set_rate("USD", "2026-01-31", "7.00")
+    rr = mb.revalue("2026-01-31")
+    check(len(rr["posted"]) == 1 and rr["posted"][0]["diff"] == "-1000.00",
+          "主数据旧链迁移后外币重估正常（-1000.00）")
+    mb.close_period("2026-01")
+    _, now_tail = mb._audit_tail()
+    check(mb._meta("audit_head") == now_tail
+          and mb._meta("snapshot_head") is not None,
+          "迁移后业务推进了链尾，两个锚点随之更新")
+    mb.verify_all()
+    check(True, "纯主数据旧链迁移后过账/重估/关账全流程一致")
+    # 重复打开：已迁移，证据文件不再需要
+    mb.close()
+    mb2 = Ledger(p1, tail_manifest_path=None)
+    mb2.verify_all()
+    check(mb2.conn.execute(
+        "SELECT COUNT(*) FROM audit_log WHERE action='schema.migrate'").fetchone()[0] == 1,
+        "迁移幂等：已迁移账本不再读取证据文件、不重复迁移")
+    mb2.close()
+
+    # --- 缺尾：证据声明的是"完整链"的尾，但末条已被删 → 证据/账面不符，阻断 ---
+    p2, n2, tail2 = build_master_only_legacy("master-tail-missing.db")
+    # 先按完整链写好证据
+    write_tail_manifest(p2 + ".tail.json", n2, tail2)
+    # 再删掉末条主数据审计（模拟缺尾）；同时把前一条的 prev_hash 链重接，
+    # 让"哈希链连续"这一项仍通过——只有外部证据能发现尾部缺失。
+    raw = sqlite3.connect(p2)
+    raw.execute("DELETE FROM audit_log WHERE id=(SELECT MAX(id) FROM audit_log)")
+    raw.commit()
+    raw.close()
+    # 不迁移，直接用裸连接重算现存链尾，确认链本身连续但与证据不符
+    raw = sqlite3.connect(p2)
+    raw.row_factory = sqlite3.Row
+    prev = None
+    continuous = True
+    for r in raw.execute("SELECT * FROM audit_log ORDER BY id"):
+        if r["prev_hash"] != prev:
+            continuous = False
+            break
+        prev = r["hash"]
+    raw.close()
+    check(continuous, "缺尾旧链被重接后哈希链本身仍连续（证明需要外部终点证据）")
+    expect_error(ConsistencyError, lambda: Ledger(p2),
+                 "证据链尾哈希与现存账本不符（末条缺失）：阻断", contains="证据与现存账本不符")
+    raw = sqlite3.connect(p2)
+    check(raw.execute("SELECT COUNT(*) FROM meta WHERE key='audit_head'").fetchone()[0] == 0
+          and raw.execute("SELECT COUNT(*) FROM audit_log WHERE action='schema.migrate'")
+              .fetchone()[0] == 0,
+          "缺尾阻断时锚点/迁移记录均不落库")
+    raw.close()
+
+    # --- 陈旧证据：条数对不上（证据来自更早一次导出）---
+    p3, n3, tail3 = build_master_only_legacy("master-stale-manifest.db")
+    # 故意写少一条的陈旧证据
+    write_tail_manifest(p3 + ".tail.json", n3 - 1, "0" * 64)
+    expect_error(ConsistencyError, lambda: Ledger(p3),
+                 "陈旧/伪造证据（条数、哈希全不符）：阻断", contains="证据与现存账本不符")
+
+    # --- 证据文件损坏：格式错误直接判证据无效 ---
+    p4, n4, tail4 = build_master_only_legacy("master-bad-manifest.db")
+    with open(p4 + ".tail.json", "w", encoding="utf-8") as f:
+        f.write("{not valid json")
+    expect_error(ConsistencyError, lambda: Ledger(p4),
+                 "证据文件损坏无法解析：阻断", contains="无法读取或解析")
+
+    # --- 业务证据充分的旧库（以凭证/关账收尾）不依赖外部证据，仍正常迁移 ---
+    p5 = os.path.join(tmp, "business-no-manifest.db")
+    bb = Ledger.create(p5)
+    bb.add_subject("1001", "现金", "D")
+    bb.add_subject("4001", "实收资本", "C")
+    bb.add_account("cash", "现金户", "1001", "CNY")
+    bb.add_account("cap", "资本户", "4001", "CNY")
+    bb.post_voucher("2026-02-01",
+                    [{"account": "cash", "currency": "CNY", "debit": "100", "credit": "0"},
+                     {"account": "cap", "currency": "CNY", "debit": "0", "credit": "100"}],
+                    memo="业务旧库")
+    bb.close()
+    raw = sqlite3.connect(p5)
+    raw.execute("DELETE FROM meta WHERE key IN ('audit_head','snapshot_head','schema_version')")
+    raw.commit()
+    raw.close()
+    assert not os.path.exists(p5 + ".tail.json")
+    bb2 = Ledger(p5, tail_manifest_path=None)  # 禁用外部证据
+    check(bb2._meta("schema_version") == Ledger.SCHEMA_VERSION,
+          "以凭证审计收尾的旧库：业务交叉证据充分，无需外部清单即迁移")
+    bb2.verify_all()
+    bb2.close()
 
     section("8. 余额核对与篡改检测")
     db.verify_balances()
