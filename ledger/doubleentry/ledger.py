@@ -144,15 +144,32 @@ class Ledger:
 
     # ---------- 构造 ----------
 
+    SCHEMA_VERSION = "2"  # v2：审计链/快照链带链头锚点；v1 账本打开时安全迁移
+
     def __init__(self, path: str):
         self.path = path
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
+        if self._has_tables():
+            # 打开既有账本：幂等补齐新表，并把 v1 无锚点账本安全迁移到 v2。
+            # 旧链无法证明连续时这里直接抛 ConsistencyError，账本保持阻断。
+            self.conn.executescript(SCHEMA)
+            self._ensure_anchors()
+
+    def _has_tables(self) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='currency'"
+        ).fetchone()
+        return row is not None
 
     @classmethod
     def create(cls, path: str, base_currency: str = "CNY", base_precision: int = 2):
-        db = cls(path)
+        db = cls.__new__(cls)
+        db.path = path
+        db.conn = sqlite3.connect(path)
+        db.conn.row_factory = sqlite3.Row
+        db.conn.execute("PRAGMA foreign_keys=ON")
         with db.conn:
             db.conn.executescript(SCHEMA)
             db.conn.execute(
@@ -162,6 +179,10 @@ class Ledger:
             db.conn.execute(
                 "INSERT OR IGNORE INTO meta(key,value) VALUES('base_precision',?)",
                 (str(base_precision),),
+            )
+            db.conn.execute(
+                "INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version',?)",
+                (cls.SCHEMA_VERSION,),
             )
             db.conn.execute(
                 "INSERT OR IGNORE INTO currency(code,name,precision) VALUES(?,?,?)",
@@ -1113,6 +1134,244 @@ class Ledger:
 
     # ---------- 一致性核对 ----------
 
+    @staticmethod
+    def _audit_row_hash(r) -> str:
+        return _sha256(
+            f"{r['prev_hash'] or ''}|{r['ts']}|{r['action']}|{r['period'] or ''}|{r['detail_json']}"
+        )
+
+    def _audit_tail(self) -> tuple[object, str | None]:
+        """纯计算审计链：逐行验证连续性/哈希，返回 (行集, 末条哈希)。不碰锚点。"""
+        rows = self.conn.execute("SELECT * FROM audit_log ORDER BY id").fetchall()
+        prev = None
+        for r in rows:
+            if r["prev_hash"] != prev:
+                raise ConsistencyError(f"审计记录 {r['id']}（{r['action']}）前链断裂")
+            if self._audit_row_hash(r) != r["hash"]:
+                raise ConsistencyError(f"审计记录 {r['id']}（{r['action']}）哈希不符")
+            prev = r["hash"]
+        return rows, prev
+
+    @staticmethod
+    def _snapshot_row_hash(r) -> str:
+        payload_hash = _sha256(
+            _canon(
+                {
+                    "balances": json.loads(r["balances_json"]),
+                    "entries": json.loads(r["entries_json"]),
+                }
+            )
+        )
+        return _sha256(
+            "|".join(
+                [
+                    r["prev_snapshot_hash"] or "",
+                    r["period"],
+                    str(r["generation"]),
+                    r["closed_at"],
+                    str(r["entry_count"]),
+                    r["dr_total"],
+                    r["cr_total"],
+                    payload_hash,
+                ]
+            )
+        )
+
+    def _snapshot_tail(self) -> tuple[object, str | None]:
+        """纯计算快照链：逐代验证连续性/哈希/分录数，返回 (行集, 末代哈希)。不碰锚点。"""
+        rows = self.conn.execute("SELECT * FROM period_snapshot ORDER BY id").fetchall()
+        prev = None
+        for r in rows:
+            if r["prev_snapshot_hash"] != prev:
+                raise ConsistencyError(
+                    f"第 {r['generation']} 代快照（{r['period']}）前链断裂"
+                )
+            if self._snapshot_row_hash(r) != r["hash"]:
+                raise ConsistencyError(
+                    f"第 {r['generation']} 代快照（{r['period']}）哈希不符"
+                )
+            entries = json.loads(r["entries_json"])
+            if len(entries) != r["entry_count"]:
+                raise ConsistencyError(
+                    f"快照 {r['period']}#{r['generation']} 分录数不一致"
+                )
+            prev = r["hash"]
+        return rows, prev
+
+    def _audit_business_evidence(self) -> None:
+        """审计链与业务表的交叉证据核对（v1 旧账本迁移时使用）。
+
+        纯 prev_hash 链无法区分"链本来就这么短"与"末条被删除后重新成链"。
+        业务凭证/快照只能由审计过的写操作产生，因此用两边集合相等补强：
+
+        * 每条 voucher.post 审计里的凭证号集合 == voucher 表凭证号集合；
+        * 每条 period.close 审计登记的 snapshot_id 集合 == 快照表 id 集合；
+        * period.reopen / fx.revalue 引用的凭证、快照必须真实存在。
+
+        任一不符说明有审计记录（含末条）被抹掉，迁移必须阻断。
+        """
+        import json as _json
+
+        posted_nos: set[str] = set()
+        closed_ids: set[int] = set()
+        rows = self.conn.execute(
+            "SELECT id, action, detail_json FROM audit_log ORDER BY id"
+        ).fetchall()
+        for r in rows:
+            try:
+                detail = _json.loads(r["detail_json"])
+            except (ValueError, TypeError):
+                raise ConsistencyError(f"审计记录 {r['id']}（{r['action']}）内容损坏")
+            if r["action"] == "voucher.post":
+                no = detail.get("voucher_no")
+                if not no:
+                    raise ConsistencyError(f"审计记录 {r['id']} 缺少凭证号")
+                posted_nos.add(no)
+            elif r["action"] == "period.close":
+                sid = detail.get("snapshot_id")
+                if sid is None:
+                    raise ConsistencyError(f"审计记录 {r['id']} 缺少快照 id")
+                closed_ids.add(int(sid))
+            elif r["action"] == "period.reopen":
+                sid = detail.get("snapshot_id")
+                if sid is None or not self.conn.execute(
+                    "SELECT 1 FROM period_snapshot WHERE id=?", (sid,)
+                ).fetchone():
+                    raise ConsistencyError(
+                        f"审计记录 {r['id']} 引用的快照 {sid} 不存在（反结账记录与快照表不符）"
+                    )
+            elif r["action"] == "fx.revalue":
+                for p in detail.get("posted", []):
+                    if not self.conn.execute(
+                        "SELECT 1 FROM voucher WHERE voucher_no=?", (p.get("voucher_no"),)
+                    ).fetchone():
+                        raise ConsistencyError(
+                            f"审计记录 {r['id']} 引用的系统凭证 {p.get('voucher_no')} 不存在"
+                        )
+
+        voucher_nos = {
+            r["voucher_no"]
+            for r in self.conn.execute("SELECT voucher_no FROM voucher").fetchall()
+        }
+        if posted_nos != voucher_nos:
+            missing = sorted(voucher_nos - posted_nos)
+            orphan = sorted(posted_nos - voucher_nos)
+            raise ConsistencyError(
+                "审计链与凭证表不一致，拒绝迁移："
+                + (f"凭证缺审计记录 {missing}；" if missing else "")
+                + (f"审计记录指向不存在的凭证 {orphan}" if orphan else "")
+            )
+        snapshot_ids = {
+            r["id"] for r in self.conn.execute("SELECT id FROM period_snapshot").fetchall()
+        }
+        if closed_ids != snapshot_ids:
+            raise ConsistencyError(
+                "审计链关账记录与快照表不一致（疑似末条关账审计被删除），拒绝迁移："
+                f"审计快照集 {sorted(closed_ids)}，快照表 {sorted(snapshot_ids)}"
+            )
+
+    def _meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def _ensure_anchors(self) -> dict:
+        """保证两条链都有链头锚点；v1 旧账本在这里做一次性安全迁移。
+
+        规则：
+        * 锚点已存在 → 用它严格比对现存末条（锚点指向的记录不在库中即判定
+          末条被删），不符则抛 :class:`ConsistencyError`，账本阻断；
+        * 锚点缺失但 schema_version>=2（迁移后账本）→ 视为锚点被人为抹掉，阻断；
+        * 锚点缺失且没有版本标记（v1 旧账本）→ 先纯计算证明整条链连续：
+          能证明就在同一事务内补写锚点并留痕 ``schema.migrate``；不能证明则
+          阻断，绝不写入锚点——锚点只记录"链的真实终点"，不能掩盖断裂。
+        """
+        migrated: list[str] = []
+        legacy = self._meta("schema_version") is None
+
+        def is_legacy_chain(head_key: str) -> bool:
+            return self._meta(head_key) is None and legacy
+
+        def adopt(head_key: str, tail: str):
+            self.conn.execute(
+                "INSERT INTO meta(key,value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (head_key, tail),
+            )
+
+        with self.conn:
+            # v1 旧账本：先用业务表交叉证据证明"没有审计记录被抹掉"，
+            # 再证明两条哈希链连续；任一不过直接阻断，绝不写入锚点。
+            if legacy:
+                self._audit_business_evidence()
+
+            # 审计链
+            audit_rows, audit_tail = self._audit_tail()
+            audit_anchor = self._meta("audit_head")
+            if audit_anchor is not None:
+                self._check_anchor("audit_head", audit_anchor, audit_rows, audit_tail,
+                                   kind="audit")
+            elif is_legacy_chain("audit_head"):
+                if audit_rows:
+                    adopt("audit_head", audit_tail)
+                    migrated.append(f"audit_head={audit_tail[:12]}…")
+            elif audit_rows:
+                # 已是 v2、链上有记录却没有锚点：只可能是锚点被人为抹掉
+                raise ConsistencyError(
+                    "已迁移账本缺少 audit_head 链头锚点，疑似被人为删除，拒绝继续"
+                )
+            # 无锚点且链为空 = 尚未发生写入的全新账本，合法
+
+            # 快照链（用同一事务，保证两条链一起迁移或一起不动）
+            snap_rows, snap_tail = self._snapshot_tail()
+            snap_anchor = self._meta("snapshot_head")
+            if snap_anchor is not None:
+                self._check_anchor("snapshot_head", snap_anchor, snap_rows, snap_tail,
+                                   kind="snapshot")
+            elif is_legacy_chain("snapshot_head"):
+                if snap_rows:
+                    adopt("snapshot_head", snap_tail)
+                    migrated.append(f"snapshot_head={snap_tail[:12]}…")
+            elif snap_rows:
+                raise ConsistencyError(
+                    "已迁移账本缺少 snapshot_head 链头锚点，疑似被人为删除，拒绝继续"
+                )
+
+            if legacy:
+                self.conn.execute(
+                    "INSERT INTO meta(key,value) VALUES('schema_version',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (self.SCHEMA_VERSION,),
+                )
+            if migrated:
+                # 有旧链可继承：写一条迁移留痕（成为新链尾），再把审计锚点指向它
+                self._audit(
+                    "schema.migrate",
+                    None,
+                    {"from": "1", "to": self.SCHEMA_VERSION, "anchors": migrated},
+                )
+                new_tail = self.conn.execute(
+                    "SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1"
+                ).fetchone()["hash"]
+                adopt("audit_head", new_tail)
+        return {"migrated": bool(migrated), "legacy": legacy, "anchors": migrated}
+
+    def _check_anchor(self, key: str, anchor, rows, tail: str | None, *, kind: str) -> None:
+        label = "审计记录" if kind == "audit" else "关账快照"
+        if not rows:
+            raise ConsistencyError(
+                f"{label}表为空但链头锚点 {key} 仍存在，{label}疑似被整体删除"
+            )
+        if anchor is None:
+            raise ConsistencyError(f"{kind} 链头锚点 {key} 缺失但链上存在 {label}，拒绝继续")
+        if anchor != tail:
+            referenced = self.conn.execute(
+                "SELECT id FROM audit_log WHERE hash=?" if kind == "audit"
+                else "SELECT id FROM period_snapshot WHERE hash=?",
+                (anchor,),
+            ).fetchone()
+            hint = "（锚点指向的记录不在库中，最后一条记录疑似被删除）" if referenced is None else ""
+            raise ConsistencyError(f"{kind} 链头锚点与现存末条记录不符{hint}")
+
     def verify_entry_hashes(self) -> None:
         rows = self.conn.execute(
             "SELECT e.*, v.voucher_no, v.voucher_date, v.is_adjustment, v.is_system "
@@ -1172,82 +1431,23 @@ class Ledger:
                 )
 
     def verify_audit_chain(self) -> None:
-        rows = self.conn.execute("SELECT * FROM audit_log ORDER BY id").fetchall()
-        prev = None
-        for r in rows:
-            if r["prev_hash"] != prev:
-                raise ConsistencyError(f"审计记录 {r['id']}（{r['action']}）前链断裂")
-            h = _sha256(
-                f"{r['prev_hash'] or ''}|{r['ts']}|{r['action']}|{r['period'] or ''}|{r['detail_json']}"
-            )
-            if h != r["hash"]:
-                raise ConsistencyError(f"审计记录 {r['id']}（{r['action']}）哈希不符")
-            prev = r["hash"]
-        # 链头锚点：meta.audit_head 必须等于现存最后一条记录的哈希。
-        # 仅靠 prev_hash 链无法发现"最后一条被删"，锚点补上这个缺口。
-        anchor = self.conn.execute(
-            "SELECT value FROM meta WHERE key='audit_head'"
-        ).fetchone()
-        if rows:
-            if anchor is None:
-                raise ConsistencyError("审计链头锚点缺失，审计记录可能被删除")
-            if anchor["value"] != prev:
-                deleted = self.conn.execute(
-                    "SELECT id,action FROM audit_log WHERE hash=?", (anchor["value"],)
-                ).fetchone()
-                hint = "（锚点指向的记录不在库中，末条审计记录疑似被删除）" if deleted is None else ""
-                raise ConsistencyError(
-                    f"审计链头锚点与现存最后一条记录不符{hint}"
-                )
-        elif anchor is not None:
-            raise ConsistencyError("审计表为空但链头锚点仍存在，审计记录疑似被整体删除")
+        # 锚点由打开账本时的 _ensure_anchors 建立/校验；这里再做一次严格比对，
+        # 覆盖"本次会话打开后锚点才被外部破坏"的情形。
+        rows, tail = self._audit_tail()
+        anchor = self._meta("audit_head")
+        if not rows:
+            if anchor is not None:
+                raise ConsistencyError("审计表为空但链头锚点仍存在，审计记录疑似被整体删除")
+            return  # 空链无尾可丢
+        self._check_anchor("audit_head", anchor, rows, tail, kind="audit")
 
     def verify_snapshots(self) -> None:
-        rows = self.conn.execute("SELECT * FROM period_snapshot ORDER BY id").fetchall()
-        prev = None
-        for r in rows:
-            if r["prev_snapshot_hash"] != prev:
-                raise ConsistencyError(f"第 {r['generation']} 代快照（{r['period']}）前链断裂")
-            payload_hash = _sha256(
-                _canon(
-                    {
-                        "balances": json.loads(r["balances_json"]),
-                        "entries": json.loads(r["entries_json"]),
-                    }
-                )
-            )
-            h = _sha256(
-                "|".join(
-                    [
-                        r["prev_snapshot_hash"] or "",
-                        r["period"],
-                        str(r["generation"]),
-                        r["closed_at"],
-                        str(r["entry_count"]),
-                        r["dr_total"],
-                        r["cr_total"],
-                        payload_hash,
-                    ]
-                )
-            )
-            if h != r["hash"]:
-                raise ConsistencyError(f"第 {r['generation']} 代快照（{r['period']}）哈希不符")
-            # 快照内部分录数与登记数一致
-            entries = json.loads(r["entries_json"])
-            if len(entries) != r["entry_count"]:
-                raise ConsistencyError(f"快照 {r['period']}#{r['generation']} 分录数不一致")
-            prev = r["hash"]
-        # 快照链头锚点：与审计链同理，用于发现最后一代快照被删
-        anchor = self.conn.execute(
-            "SELECT value FROM meta WHERE key='snapshot_head'"
-        ).fetchone()
+        rows, tail = self._snapshot_tail()
+        anchor = self._meta("snapshot_head")
+        if rows and anchor is None:
+            raise ConsistencyError("快照链头锚点缺失，关账快照可能被删除")
         if rows:
-            if anchor is None:
-                raise ConsistencyError("快照链头锚点缺失，关账快照可能被删除")
-            if anchor["value"] != prev:
-                raise ConsistencyError(
-                    "快照链头锚点与现存最后一代快照不符（末代快照疑似被删除）"
-                )
+            self._check_anchor("snapshot_head", anchor, rows, tail, kind="snapshot")
         elif anchor is not None:
             raise ConsistencyError("快照表为空但链头锚点仍存在，快照疑似被整体删除")
 
@@ -1291,6 +1491,7 @@ class Ledger:
     def verify_all(self) -> dict:
         self.verify_entry_hashes()
         self.verify_balances()
+        self._audit_business_evidence()
         self.verify_audit_chain()
         self.verify_snapshots()
         eq = self.accounting_equation()

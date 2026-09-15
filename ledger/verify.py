@@ -558,6 +558,217 @@ def main() -> int:
     reopen_rec = next(r for r in trail if r["action"] == "period.reopen")
     check("审计调整" in reopen_rec["detail_json"], "反结账原因留痕在审计链中")
 
+    section("7B. 旧版本账本升级：无锚点旧链安全迁移，无法证明则阻断")
+
+    def build_legacy_book(name: str, *, empty: bool = False) -> str:
+        """用当前引擎造一本账，再剥掉 v2 标记，模拟"v1 旧账本"文件。"""
+        path = os.path.join(tmp, name)
+        b = Ledger.create(path)
+        if not empty:
+            b.add_currency("USD", "美元", 2)
+            b.add_subject("1002", "银行存款", "D")
+            b.add_subject("4001", "实收资本", "C")
+            b.add_subject("6701", "汇兑损益", "D")
+            b.add_account("cny", "人民币户", "1002", "CNY")
+            b.add_account("usd", "美元户", "1002", "USD")
+            b.add_account("cap", "资本户", "4001", "CNY")
+            b.add_account("gl", "汇兑损益户", "6701", "CNY")
+            b.configure_fx("6701", "gl")
+            b.set_rate("USD", "2026-01-05", "7.10")
+            b.set_rate("USD", "2026-01-31", "7.00")
+            b.post_voucher("2026-01-02",
+                           [{"account": "cap", "currency": "CNY", "debit": "0", "credit": "100000"},
+                            {"account": "cny", "currency": "CNY", "debit": "100000", "credit": "0"}],
+                           memo="投资")
+            b.post_voucher("2026-01-05",
+                           [{"account": "usd", "currency": "USD", "debit": "10000", "credit": "0"},
+                            {"account": "cny", "currency": "CNY", "debit": "0", "credit": "71000"}],
+                           memo="购汇")
+            r = b.revalue("2026-01-31")
+            assert len(r["posted"]) == 1 and r["posted"][0]["diff"] == "-1000.00"
+            b.close_period("2026-01")
+        b.close()
+        # 剥掉链头锚点与版本号 → v1 时代的文件形态
+        raw = sqlite3.connect(path)
+        raw.execute("DELETE FROM meta WHERE key IN ('audit_head','snapshot_head','schema_version')")
+        raw.commit()
+        raw.close()
+        return path
+
+    # A. 完整旧链：打开即迁移，随后核对/过账/重估/反结账/再关账全流程
+    legacy_path = build_legacy_book("legacy.db")
+    oldb = Ledger(legacy_path)
+    check(oldb._meta("schema_version") == Ledger.SCHEMA_VERSION,
+          "旧账本打开后自动升级到当前 schema 版本")
+    audit_rows, audit_tail = oldb._audit_tail()
+    check(oldb._meta("audit_head") == audit_tail,
+          "迁移写入 audit_head，指向连续旧链的真实终点")
+    mig = oldb.conn.execute(
+        "SELECT * FROM audit_log WHERE action='schema.migrate' ORDER BY id"
+    ).fetchall()
+    check(len(mig) == 1 and "audit_head" in mig[0]["detail_json"],
+          "迁移本身留痕（schema.migrate，含采纳的锚点）")
+    oldb.verify_all()
+    check(True, "迁移后旧账本通过全量一致性核对")
+    check(oldb.list_periods()[0]["status"] == "closed", "迁移不改变期间状态（1 月仍关闭）")
+    expect_error(PeriodClosedError,
+                 lambda: oldb.post_voucher(
+                     "2026-01-20",
+                     [{"account": "cny", "currency": "CNY", "debit": "100", "credit": "0"},
+                      {"account": "cap", "currency": "CNY", "debit": "0", "credit": "100"}]),
+                 "迁移后旧关账期依然阻断过账")
+    # 反结账与调整标记规则在迁移账本上继续生效
+    oldb.reopen_period("2026-01", "旧账升级后补记")
+    expect_error(ValidationError,
+                 lambda: oldb.post_voucher(
+                     "2026-01-25",
+                     [{"account": "gl", "currency": "CNY", "debit": "50", "credit": "0"},
+                      {"account": "cny", "currency": "CNY", "debit": "0", "credit": "50"}]),
+                 "迁移账本反结账后未标调整仍被拒")
+    oldb.post_voucher(
+        "2026-01-25",
+        [{"account": "gl", "currency": "CNY", "debit": "50", "credit": "0"},
+         {"account": "cny", "currency": "CNY", "debit": "0", "credit": "50"}],
+        memo="迁移账本调整", is_adjustment=True)
+    oldb.close_period("2026-01")
+    check(oldb.verify_latest_snapshot_matches_books("2026-01")["matched"],
+          "迁移账本再关账快照与账面一致")
+    # 2 月新业务：过账 + 月末重估 + 关账
+    oldb.set_rate("USD", "2026-02-28", "6.95")
+    oldb.post_voucher(
+        "2026-02-10",
+        [{"account": "cny", "currency": "CNY", "debit": "1000", "credit": "0"},
+         {"account": "cap", "currency": "CNY", "debit": "0", "credit": "1000"}],
+        memo="2月业务")
+    rf = oldb.revalue("2026-02-28")
+    check(len(rf["posted"]) == 1 and rf["posted"][0]["diff"] == "-500.00",
+          "迁移账本 2 月重估正常（USD 10000：7.00→6.95，差额 -500）",
+          str([(p["account"], p["diff"]) for p in rf["posted"]]))
+    oldb.close_period("2026-02")
+    snap_n = oldb.conn.execute("SELECT COUNT(*) c FROM period_snapshot").fetchone()["c"]
+    check(snap_n == 3, f"迁移账本累计 3 代快照（实际 {snap_n}）")
+    _, tail_after = oldb._audit_tail()
+    check(oldb._meta("audit_head") == tail_after
+          and oldb._meta("snapshot_head") ==
+          oldb.conn.execute("SELECT hash FROM period_snapshot ORDER BY id DESC LIMIT 1")
+              .fetchone()["hash"],
+          "后续写入持续推进两个链头锚点")
+    oldb.verify_all()
+    check(True, "迁移账本走完核对/过账/重估/反结账/再关账后仍全部一致")
+    oldb.close()
+
+    # 再次打开：迁移幂等，不重复留痕
+    oldb2 = Ledger(legacy_path)
+    check(oldb2.conn.execute(
+        "SELECT COUNT(*) c FROM audit_log WHERE action='schema.migrate'").fetchone()["c"] == 1,
+        "重复打开不重复迁移（schema.migrate 仅 1 条）")
+    oldb2.verify_all()
+
+    # 迁移之后，删除最后一条审计记录（2 月关账）仍必须被发现
+    oldb2.close()
+    raw = sqlite3.connect(legacy_path)
+    raw.execute("DELETE FROM audit_log WHERE id=(SELECT MAX(id) FROM audit_log)")
+    raw.commit()
+    raw.close()
+    expect_error(ConsistencyError, lambda: Ledger(legacy_path),
+                 "迁移后删除最后一条审计记录：打开即阻断", contains="末条")
+
+    # B. 旧账本最后一条审计已缺失（关账记录被抹）：证据不一致，拒绝迁移
+    p_b = build_legacy_book("legacy-tail-missing.db")
+    raw = sqlite3.connect(p_b)
+    raw.execute("DELETE FROM audit_log WHERE action='period.close'")
+    raw.commit()
+    raw.close()
+    expect_error(ConsistencyError, lambda: Ledger(p_b),
+                 "旧链缺末条关账记录：业务证据不符，拒绝迁移（不补锚点）",
+                 contains="拒绝迁移")
+    raw = sqlite3.connect(p_b)
+    check(raw.execute("SELECT COUNT(*) FROM meta WHERE key='audit_head'").fetchone()[0] == 0,
+          "阻断时锚点未被写入，账本保持原样")
+    raw.close()
+
+    # B2. 旧账本最后一张凭证的过账审计被删（凭证表有、审计链无）：证据不符，阻断
+    p_b2 = build_legacy_book("legacy-voucher-audit-missing.db")
+    raw = sqlite3.connect(p_b2)
+    # 末张凭证是系统重估凭证 R-...，其 voucher.post 审计在链尾附近
+    last_no = raw.execute("SELECT voucher_no FROM voucher ORDER BY id DESC LIMIT 1").fetchone()[0]
+    raw.execute("DELETE FROM audit_log WHERE action='voucher.post' AND id=("
+                "SELECT MAX(id) FROM audit_log WHERE action='voucher.post')")
+    raw.commit()
+    raw.close()
+    expect_error(ConsistencyError, lambda: Ledger(p_b2),
+                 f"凭证 {last_no} 缺过账审计：审计/凭证证据不一致，拒绝迁移",
+                 contains="凭证缺审计记录")
+
+    # C. 旧链业务证据齐全但哈希被改：连续性无法证明，拒绝迁移
+    p_c = build_legacy_book("legacy-hash-bad.db")
+    raw = sqlite3.connect(p_c)
+    raw.execute("UPDATE audit_log SET detail_json='{\"tampered\":true}' "
+                "WHERE id=(SELECT MIN(id) FROM audit_log)")
+    raw.commit()
+    raw.close()
+    expect_error(ConsistencyError, lambda: Ledger(p_c),
+                 "旧链首条记录内容被改：哈希不符，拒绝迁移", contains="哈希不符")
+
+    # D. 旧快照被删但关账审计还在：快照证据集不一致，拒绝迁移
+    p_d = build_legacy_book("legacy-snapshot-missing.db")
+    raw = sqlite3.connect(p_d)
+    raw.execute("DELETE FROM period_snapshot")
+    raw.commit()
+    raw.close()
+    expect_error(ConsistencyError, lambda: Ledger(p_d),
+                 "旧快照缺失而关账审计仍在：拒绝迁移", contains="拒绝迁移")
+
+    # E. 空的 v1 账本（无任何业务记录）：可安全升级，无需锚点/迁移留痕
+    p_e = build_legacy_book("legacy-empty.db", empty=True)
+    eb = Ledger(p_e)
+    check(eb._meta("schema_version") == Ledger.SCHEMA_VERSION
+          and eb.conn.execute("SELECT COUNT(*) c FROM audit_log").fetchone()["c"] == 0,
+          "空旧账本升级：仅置版本号，不伪造迁移记录或锚点")
+    eb.verify_all()
+    # 升级后立刻可正常使用
+    eb.add_subject("1001", "现金", "D")
+    eb.add_account("cash", "现金户", "1001", "CNY")
+    eb.add_subject("4001", "实收资本", "C")
+    eb.add_account("cap", "资本户", "4001", "CNY")
+    eb.post_voucher("2026-03-01",
+                    [{"account": "cash", "currency": "CNY", "debit": "100", "credit": "0"},
+                     {"account": "cap", "currency": "CNY", "debit": "0", "credit": "100"}],
+                    memo="升级后首笔")
+    check(eb._meta("audit_head") is not None, "空旧账本首次写入后自动建立锚点")
+    eb.verify_all()
+    eb.close()
+
+    # F. 全新 v2 账本（CLI 跨进程场景）：创建后尚无任何业务记录时重新打开，
+    #    不能误判为"锚点被删除"；之后正常写入、核对
+    p_f = os.path.join(tmp, "fresh-reopen.db")
+    fb1 = Ledger.create(p_f)
+    fb1.close()
+    fb2 = Ledger(p_f)
+    check(fb2._meta("schema_version") == Ledger.SCHEMA_VERSION
+          and fb2.conn.execute("SELECT COUNT(*) c FROM audit_log").fetchone()["c"] == 0,
+          "全新空账本重新打开不被误判损坏（无锚点但链为空 = 尚未写入）")
+    fb2.verify_all()
+    fb2.add_subject("1001", "现金", "D")
+    fb2.add_subject("4001", "实收资本", "C")
+    fb2.add_account("cash", "现金户", "1001", "CNY")
+    fb2.add_account("cap", "资本户", "4001", "CNY")
+    fb2.post_voucher("2026-03-02",
+                     [{"account": "cash", "currency": "CNY", "debit": "200", "credit": "0"},
+                      {"account": "cap", "currency": "CNY", "debit": "0", "credit": "200"}],
+                     memo="重开后首笔")
+    fb2.verify_all()
+    check(fb2._meta("audit_head") ==
+          fb2.conn.execute("SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1")
+              .fetchone()["hash"],
+          "重开后的新写入正确建立并推进锚点")
+    fb2.close()
+    fb3 = Ledger(p_f)
+    fb3.verify_all()
+    check(fb3.conn.execute("SELECT COUNT(*) c FROM audit_log").fetchone()["c"] >= 5,
+          "全新账本第三次打开一切正常（init/2 主数据/过账审计完整）")
+    fb3.close()
+
     section("8. 余额核对与篡改检测")
     db.verify_balances()
     check(True, "余额表逐账户与分录重算一致（外币 + 本位币）")
