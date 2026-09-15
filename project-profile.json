@@ -1,0 +1,11 @@
+{
+  "projectId": "ccdata_yf_02",
+  "projectName": "Canvas Room",
+  "category": "未分类",
+  "businessDomain": "待补充",
+  "projectForm": "完整项目",
+  "codeScope": "frontend",
+  "languages": ["HTML", "CSS", "JavaScript"],
+  "summary": "Canvas Room collaborative whiteboard demo with notes, text, shapes, lines, member cursors, undo and PNG export.",
+  "containerized": false
+}
