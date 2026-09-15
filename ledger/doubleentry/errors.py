@@ -20,6 +20,30 @@ class ValidationError(LedgerError):
     code = "E_VALIDATION"
 
 
+class UnbalancedVoucherError(ValidationError):
+    """借贷不平：错误信息逐条列出对应分录的本位币借贷金额。"""
+
+    code = "E_UNBALANCED"
+
+    def __init__(self, base_currency: str, total_debit, total_credit, diff, lines: list[dict]):
+        self.total_debit = total_debit
+        self.total_credit = total_credit
+        self.diff = diff
+        # lines: [{line, account, currency, base_debit, base_credit, rate}]
+        self.line_details = lines
+        breakdown = "；".join(
+            f"分录 {l['line']}（{l['account']}/{l['currency']}"
+            + (f"，汇率 {l['rate']}" if l["rate"] is not None else "")
+            + f"）：借 {l['base_debit']} / 贷 {l['base_credit']}"
+            for l in lines
+        )
+        super().__init__(
+            f"凭证借贷不平（本位币 {base_currency}）：借方合计 {total_debit}，"
+            f"贷方合计 {total_credit}，差额 {diff}。对应分录本位币金额 → {breakdown}。"
+            "请核对各分录金额与汇率"
+        )
+
+
 class LineError(LedgerError):
     """可定位到具体分录行的错误。line 为分录序号（从 1 开始）。"""
 

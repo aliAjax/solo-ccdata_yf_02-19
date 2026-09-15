@@ -29,6 +29,7 @@ from doubleentry import (  # noqa: E402
     Ledger,
     LineError,
     PeriodClosedError,
+    UnbalancedVoucherError,
     ValidationError,
 )
 from doubleentry.money import convert, quantize  # noqa: E402
@@ -222,16 +223,30 @@ def main() -> int:
         ),
         "账户币种不符：定位到第 1 条分录", contains="币种", line=1,
     )
-    # 3.6 借贷不平（本位币差额）→ 凭证级错误并给出差额
-    exc = expect_error(
-        ValidationError,
-        lambda: db.post_voucher(
+    # 3.6 借贷不平（本位币差额）→ 凭证级错误，给出差额并逐条指出对应分录
+    def _unbalanced():
+        db.post_voucher(
             "2026-01-12",
             [{"account": "1002-USD", "currency": "USD", "debit": "100", "credit": "0"},
              {"account": "1002-CNY", "currency": "CNY", "debit": "0", "credit": "700"}],
-        ),
-        "借贷不平被拒（差额 10.00 CNY）", contains="差额 10.00",
-    )
+        )
+
+    try:
+        _unbalanced()
+        check(False, "借贷不平被拒（差额 10.00 CNY）", "未抛错")
+        exc = None
+    except UnbalancedVoucherError as e:
+        exc = e
+        check(True, "借贷不平被拒（差额 10.00 CNY）")
+    check(exc is not None and "差额 10.00" in str(exc),
+          "不平错误包含本位币差额 10.00", str(exc))
+    check(exc is not None and {d["line"] for d in exc.line_details} == {1, 2},
+          "不平错误引用了全部对应分录（分录 1、2）",
+          str([(d["line"], d["account"], d["base_debit"], d["base_credit"])
+               for d in (exc.line_details if exc else [])]))
+    check(exc is not None and "分录 1" in str(exc) and "分录 2" in str(exc)
+          and "710.00" in str(exc) and "700.00" in str(exc),
+          "不平错误文本列出每条分录的本位币借贷金额", str(exc))
     # 3.7 配置缺失：未配置汇兑损益的新账本该在重估时报 ConfigurationError
     db_bare = Ledger.create(os.path.join(tmp, "bare.db"))
     db_bare.add_subject("1002", "银行", "D")
@@ -302,6 +317,116 @@ def main() -> int:
     rev2 = db.revalue("2026-01-31")
     check(rev2["posted"] == [] and len(rev2["skipped"]) == 3,
           "同一汇率日再次重估：0 张凭证、3 个账户跳过（幂等）")
+
+    section("4B. 批量重估原子性：任一账户失败不留半批，重试等价一次成功")
+
+    def build_atomic_ledger(name: str, *, with_eur_month_rate: bool) -> Ledger:
+        b = Ledger.create(os.path.join(tmp, name))
+        b.add_currency("USD", "美元", 2)
+        b.add_currency("EUR", "欧元", 2)
+        b.add_subject("1002", "银行存款", "D")
+        b.add_subject("4001", "实收资本", "C")
+        b.add_subject("6701", "汇兑损益", "D")
+        b.add_account("a-usd", "美元户", "1002", "USD")
+        b.add_account("a-eur", "欧元户", "1002", "EUR")
+        b.add_account("cap", "资本户", "4001", "CNY")
+        b.add_account("gl", "汇兑损益户", "6701", "CNY")
+        b.configure_fx("6701", "gl")
+        b.set_rate("USD", "2026-01-02", "7.10")
+        b.set_rate("EUR", "2026-01-02", "7.80")
+        b.set_rate("USD", "2026-01-31", "7.00")
+        if with_eur_month_rate:
+            b.set_rate("EUR", "2026-01-31", "7.90")
+        b.post_voucher("2026-01-02",
+                       [{"account": "a-usd", "currency": "USD", "debit": "1000", "credit": "0"},
+                        {"account": "cap", "currency": "CNY", "debit": "0", "credit": "7100"}],
+                       memo="购汇 USD")
+        b.post_voucher("2026-01-02",
+                       [{"account": "a-eur", "currency": "EUR", "debit": "1000", "credit": "0"},
+                        {"account": "cap", "currency": "CNY", "debit": "0", "credit": "7800"}],
+                       memo="购汇 EUR")
+        return b
+
+    def system_voucher_nos(b: Ledger) -> list[str]:
+        return [v["voucher_no"] for v in b.list_vouchers() if v["is_system"]]
+
+    def fx_audit_count(b: Ledger) -> int:
+        return b.conn.execute(
+            "SELECT COUNT(*) c FROM audit_log WHERE action='fx.revalue'"
+        ).fetchone()["c"]
+
+    # --- 重试账本：先缺 EUR 当日汇率，失败后补齐再重试 ---
+    rb = build_atomic_ledger("retry.db", with_eur_month_rate=False)
+    expect_error(ValidationError, lambda: rb.revalue("2026-01-31"),
+                 "EUR 缺当日汇率：整批重估中止", contains="整批重估中止")
+    check(system_voucher_nos(rb) == [], "失败后没有任何系统凭证残留（USD 也未入账）")
+    check(fx_audit_count(rb) == 0, "失败后没有 fx.revalue 审计记录残留")
+    rb.verify_audit_chain()
+    check(True, "失败后审计链头锚点完好（事务整体回滚）")
+    rb.verify_balances()
+    rb_bal = {x["account"]: x for x in rb.balances()}
+    check(rb_bal["a-usd"]["base_amount"] == Decimal("7100.00")
+          and rb_bal["a-eur"]["base_amount"] == Decimal("7800.00"),
+          "失败后两个外币户本位币余额维持原值 7100/7800，无半批改写")
+
+    rb.set_rate("EUR", "2026-01-31", "7.90")
+    rev_retry = rb.revalue("2026-01-31")
+
+    # --- 对照账本：汇率齐全，一次成功 ---
+    sb = build_atomic_ledger("oneshot.db", with_eur_month_rate=True)
+    rev_oneshot = sb.revalue("2026-01-31")
+
+    retry_meta = sorted(
+        (p["voucher_no"], p["account"], p["diff"]) for p in rev_retry["posted"])
+    oneshot_meta = sorted(
+        (p["voucher_no"], p["account"], p["diff"]) for p in rev_oneshot["posted"])
+    check(len(rev_retry["posted"]) == 2, "重试成功：2 张系统凭证（USD 损失 + EUR 收益）")
+    check(retry_meta == oneshot_meta,
+          "重试结果与一次成功完全一致（凭证号/账户/差额）",
+          f"retry={retry_meta} oneshot={oneshot_meta}")
+    check([d[2] for d in retry_meta] == ["100.00", "-100.00"],
+          "差额正确：EUR +100.00 收益、USD -100.00 损失", str(retry_meta))
+    for b, tag in ((rb, "重试账本"), (sb, "一次成功账本")):
+        bals = {x["account"]: x for x in b.balances()}
+        check(bals["a-usd"]["base_amount"] == Decimal("7000.00")
+              and bals["a-eur"]["base_amount"] == Decimal("7900.00"),
+              f"{tag}：重估后 USD 7000.00 / EUR 7900.00")
+        b.verify_all()
+    check(system_voucher_nos(rb) == system_voucher_nos(sb),
+          "失败不留号：重试后系统凭证编号与一次成功一致（失败尝试未消耗凭证号）",
+          f"{system_voucher_nos(rb)} vs {system_voucher_nos(sb)}")
+
+    # --- 落库中途失败：第二张系统凭证写入时异常，整批回滚 ---
+    fb = build_atomic_ledger("midfail.db", with_eur_month_rate=True)
+    orig_persist = Ledger._persist_voucher
+    state = {"calls": 0}
+
+    def flaky_persist(self, prep, *, voucher_no=None):
+        state["calls"] += 1
+        if state["calls"] == 2:
+            raise RuntimeError("模拟落库中途失败")
+        return orig_persist(self, prep, voucher_no=voucher_no)
+
+    Ledger._persist_voucher = flaky_persist
+    try:
+        try:
+            fb.revalue("2026-01-31")
+            check(False, "落库中途异常向外传播", "未抛错")
+        except RuntimeError as e:
+            check("模拟落库中途失败" in str(e), "落库中途异常向外传播（不静默吞掉）")
+    finally:
+        Ledger._persist_voucher = orig_persist
+    check(system_voucher_nos(fb) == [], "中途失败后第一张已写凭证也随事务回滚，无残留")
+    check(fx_audit_count(fb) == 0, "中途失败后无批次审计记录/锚点残留")
+    fb.verify_all()
+    check(True, "中途失败后账本仍通过全部一致性核对")
+    rev_fb = fb.revalue("2026-01-31")
+    check(sorted((p["voucher_no"], p["diff"]) for p in rev_fb["posted"])
+          == sorted((p["voucher_no"], p["diff"]) for p in rev_oneshot["posted"]),
+          "中途失败后的重试仍与一次成功结果一致")
+    rb.close()
+    sb.close()
+    fb.close()
 
     section("5. 关账阻断")
     eq = db.accounting_equation()
@@ -457,13 +582,33 @@ def main() -> int:
     raw.close()
     db2.verify_balances()
 
-    # 篡改 2：删除一条审计记录 → 审计链断裂
+    # 篡改 2a：删除最后一条审计记录 —— 前链本身仍然连续，只能靠链头锚点发现
+    last_audit_id = db2.conn.execute("SELECT MAX(id) m FROM audit_log").fetchone()["m"]
+    last_action = db2.conn.execute(
+        "SELECT action FROM audit_log WHERE id=?", (last_audit_id,)
+    ).fetchone()["action"]
+    raw = sqlite3.connect(db_path)
+    raw.execute("DELETE FROM audit_log WHERE id=(SELECT MAX(id) FROM audit_log)")
+    raw.commit()
+    raw.close()
+    expect_error(ConsistencyError, db2.verify_audit_chain,
+                 f"删除最后一条审计记录（{last_action}）被链头锚点发现", contains="末条")
+
+    # 篡改 2b：再删最旧一条 —— 前链断裂
     raw = sqlite3.connect(db_path)
     raw.execute("DELETE FROM audit_log WHERE id=(SELECT MIN(id) FROM audit_log)")
     raw.commit()
     raw.close()
     expect_error(ConsistencyError, db2.verify_audit_chain,
-                 "删除审计记录导致哈希链断裂被发现", contains="断")
+                 "删除最旧审计记录导致前链断裂被发现", contains="断")
+
+    # 篡改 2c：删除最后一代关账快照 —— 快照链头锚点发现
+    raw = sqlite3.connect(db_path)
+    raw.execute("DELETE FROM period_snapshot WHERE id=(SELECT MAX(id) FROM period_snapshot)")
+    raw.commit()
+    raw.close()
+    expect_error(ConsistencyError, db2.verify_snapshots,
+                 "删除最后一代关账快照被快照链头锚点发现", contains="末")
 
     # 篡改 3：篡改分录金额 → 分录哈希不符
     raw = sqlite3.connect(db_path)

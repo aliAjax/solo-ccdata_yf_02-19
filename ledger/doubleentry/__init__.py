@@ -7,6 +7,7 @@ from .errors import (
     LineError,
     NotFoundError,
     PeriodClosedError,
+    UnbalancedVoucherError,
     ValidationError,
 )
 from .ledger import Ledger
@@ -15,6 +16,7 @@ __all__ = [
     "Ledger",
     "LedgerError",
     "ValidationError",
+    "UnbalancedVoucherError",
     "LineError",
     "PeriodClosedError",
     "NotFoundError",

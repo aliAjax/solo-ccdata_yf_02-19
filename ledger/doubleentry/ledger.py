@@ -27,6 +27,7 @@ from .errors import (
     LineError,
     NotFoundError,
     PeriodClosedError,
+    UnbalancedVoucherError,
     ValidationError,
 )
 from .money import D, convert, is_quantized, quantize, rate_to_decimal
@@ -226,7 +227,11 @@ class Ledger:
         return row
 
     def _audit(self, action: str, period: str | None, detail: dict) -> int:
-        """追加审计记录，按前一条哈希串联成链。"""
+        """追加审计记录，按前一条哈希串联成链；同步更新链头锚点。
+
+        调用方必须已经处于写事务中——锚点更新与记录插入必须原子提交，
+        否则整批重估回滚时会留下悬空锚点。
+        """
         last = self.conn.execute("SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1").fetchone()
         prev = last["hash"] if last else None
         ts = self._now()
@@ -235,6 +240,11 @@ class Ledger:
             "INSERT INTO audit_log(ts,action,period,detail_json,prev_hash,hash)"
             " VALUES(?,?,?,?,?,?)",
             (ts, action, period, _canon(detail), prev, h),
+        )
+        self.conn.execute(
+            "INSERT INTO meta(key,value) VALUES('audit_head',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (h,),
         )
         return cur.lastrowid
 
@@ -368,7 +378,7 @@ class Ledger:
         voucher_no: str | None = None,
         _system: bool = False,
     ) -> dict:
-        """过账一张含多条借贷分录的凭证。
+        """过账一张含多条借贷分录的凭证（公共入口，自带事务）。
 
         每条 line 为::
 
@@ -376,8 +386,26 @@ class Ledger:
              "debit": "100", "credit": "0"}        # debit/credit 二选一且 > 0
 
         系统重估凭证内部使用 ``base_debit/base_credit`` 表达外币为 0、本位币有差额的行。
-        错误以 :class:`LineError`（带分录序号）或 :class:`ValidationError` 抛出。
+        错误以 :class:`LineError`（带分录序号）或 :class:`UnbalancedVoucherError`
+        （不平，逐条列出对应分录的本位币金额）抛出；校验全部通过后才开启事务。
         """
+        prep = self._prepare_voucher(
+            voucher_date, lines, memo,
+            is_adjustment=is_adjustment, _system=_system,
+        )
+        with self.conn:
+            return self._persist_voucher(prep, voucher_no=voucher_no)
+
+    def _prepare_voucher(
+        self,
+        voucher_date: str,
+        lines: list[dict],
+        memo: str,
+        *,
+        is_adjustment: bool,
+        _system: bool,
+    ) -> dict:
+        """纯校验 + 折算准备，不做任何写入；批量重估用它做事务前预检。"""
         try:
             _date.fromisoformat(voucher_date)
         except ValueError:
@@ -484,10 +512,44 @@ class Ledger:
 
         diff = quantize(total_dr - total_cr, base_prec)
         if diff != 0:
-            raise ValidationError(
-                f"凭证借贷不平（本位币 {base_ccy}）：借方 {total_dr} / 贷方 {total_cr}，"
-                f"差额 {diff}；请检查各分录汇率与金额"
+            raise UnbalancedVoucherError(
+                base_ccy,
+                quantize(total_dr, base_prec),
+                quantize(total_cr, base_prec),
+                diff,
+                [
+                    {
+                        "line": p["line_no"],
+                        "account": p["account"],
+                        "currency": p["currency"],
+                        "base_debit": str(p["base_debit"]),
+                        "base_credit": str(p["base_credit"]),
+                        "rate": p["rate"],
+                    }
+                    for p in prepared
+                ],
             )
+
+        return {
+            "voucher_date": voucher_date,
+            "period": period,
+            "memo": memo,
+            "is_adjustment": is_adjustment,
+            "is_system": _system,
+            "prepared": prepared,
+            "total_dr": total_dr,
+            "total_cr": total_cr,
+        }
+
+    def _persist_voucher(self, prep: dict, *, voucher_no: str | None = None) -> dict:
+        """把已通过校验的凭证写入库。调用方必须已持有事务；本方法不自行提交。"""
+        voucher_date = prep["voucher_date"]
+        period = prep["period"]
+        memo = prep["memo"]
+        is_adjustment = prep["is_adjustment"]
+        _system = prep["is_system"]
+        prepared = prep["prepared"]
+        total_dr = prep["total_dr"]
 
         no = voucher_no or self._next_voucher_no(period, "R-" if _system else "V-")
         ts = self._now()
@@ -504,82 +566,81 @@ class Ledger:
             }
             for p in prepared
         ]
-        with self.conn:
-            cur = self.conn.execute(
-                "INSERT INTO voucher(voucher_no,voucher_date,period,memo,"
-                "is_adjustment,is_system,created_at) VALUES(?,?,?,?,?,?,?)",
-                (no, voucher_date, period, memo, int(is_adjustment), int(_system), ts),
-            )
-            vid = cur.lastrowid
-            for p in prepared:
-                eh = _sha256(
-                    "|".join(
-                        [
-                            no,
-                            voucher_date,
-                            str(int(is_adjustment)),
-                            str(int(_system)),
-                            str(p["line_no"]),
-                            p["account"],
-                            p["currency"],
-                            str(p["debit"]),
-                            str(p["credit"]),
-                            str(p["base_debit"]),
-                            str(p["base_credit"]),
-                            str(p["rate"]) if p["rate"] is not None else "",
-                        ]
-                    )
-                )
-                self.conn.execute(
-                    "INSERT INTO entry(voucher_id,line_no,account,currency,debit,credit,"
-                    "base_debit,base_credit,rate,entry_hash) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        vid,
-                        p["line_no"],
+        cur = self.conn.execute(
+            "INSERT INTO voucher(voucher_no,voucher_date,period,memo,"
+            "is_adjustment,is_system,created_at) VALUES(?,?,?,?,?,?,?)",
+            (no, voucher_date, period, memo, int(is_adjustment), int(_system), ts),
+        )
+        vid = cur.lastrowid
+        for p in prepared:
+            eh = _sha256(
+                "|".join(
+                    [
+                        no,
+                        voucher_date,
+                        str(int(is_adjustment)),
+                        str(int(_system)),
+                        str(p["line_no"]),
                         p["account"],
                         p["currency"],
                         str(p["debit"]),
                         str(p["credit"]),
                         str(p["base_debit"]),
                         str(p["base_credit"]),
-                        str(p["rate"]) if p["rate"] is not None else None,
-                        eh,
+                        str(p["rate"]) if p["rate"] is not None else "",
+                    ]
+                )
+            )
+            self.conn.execute(
+                "INSERT INTO entry(voucher_id,line_no,account,currency,debit,credit,"
+                "base_debit,base_credit,rate,entry_hash) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    vid,
+                    p["line_no"],
+                    p["account"],
+                    p["currency"],
+                    str(p["debit"]),
+                    str(p["credit"]),
+                    str(p["base_debit"]),
+                    str(p["base_credit"]),
+                    str(p["rate"]) if p["rate"] is not None else None,
+                    eh,
+                ),
+            )
+            net_fx = p["debit"] - p["credit"]
+            net_base = p["base_debit"] - p["base_credit"]
+            existing = self.conn.execute(
+                "SELECT fx_amount, base_amount FROM ledger_balance WHERE account=?",
+                (p["account"],),
+            ).fetchone()
+            if existing is None:
+                self.conn.execute(
+                    "INSERT INTO ledger_balance(account,currency,fx_amount,base_amount) "
+                    "VALUES(?,?,?,?)",
+                    (p["account"], p["currency"], str(net_fx), str(net_base)),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE ledger_balance SET fx_amount=?, base_amount=? WHERE account=?",
+                    (
+                        str(D(existing["fx_amount"]) + net_fx),
+                        str(D(existing["base_amount"]) + net_base),
+                        p["account"],
                     ),
                 )
-                net_fx = p["debit"] - p["credit"]
-                net_base = p["base_debit"] - p["base_credit"]
-                existing = self.conn.execute(
-                    "SELECT fx_amount, base_amount FROM ledger_balance WHERE account=?",
-                    (p["account"],),
-                ).fetchone()
-                if existing is None:
-                    self.conn.execute(
-                        "INSERT INTO ledger_balance(account,currency,fx_amount,base_amount) "
-                        "VALUES(?,?,?,?)",
-                        (p["account"], p["currency"], str(net_fx), str(net_base)),
-                    )
-                else:
-                    self.conn.execute(
-                        "UPDATE ledger_balance SET fx_amount=?, base_amount=? WHERE account=?",
-                        (
-                            str(D(existing["fx_amount"]) + net_fx),
-                            str(D(existing["base_amount"]) + net_base),
-                            p["account"],
-                        ),
-                    )
-            audit_id = self._audit(
-                "voucher.post",
-                period,
-                {
-                    "voucher_no": no,
-                    "date": voucher_date,
-                    "memo": memo,
-                    "adjustment": bool(is_adjustment),
-                    "system": bool(_system),
-                    "base_total": str(total_dr),
-                    "lines": detail_lines,
-                },
-            )
+        audit_id = self._audit(
+            "voucher.post",
+            period,
+            {
+                "voucher_no": no,
+                "date": voucher_date,
+                "memo": memo,
+                "adjustment": bool(is_adjustment),
+                "system": bool(_system),
+                "base_total": str(total_dr),
+                "lines": detail_lines,
+            },
+        )
 
         return {
             "voucher_id": vid,
@@ -596,22 +657,119 @@ class Ledger:
     # ---------- 期末外币重估 ----------
 
     def revalue(self, rate_date: str, accounts: list[str] | None = None, *, memo: str = "") -> dict:
-        """按指定汇率日重估外币账户余额，汇兑差额自动入账。
+        """按指定汇率日**整批**重估外币账户余额，汇兑差额自动入账。
 
+        原子性保证（两阶段）：
+          1. 预检阶段（只读）：聚合截至重估日余额，逐个账户校验当日汇率、
+             计算差额、构建并校验全部系统凭证。任一账户缺汇率或任一凭证不平衡，
+             直接抛出——此时尚未写入任何东西；
+          2. 提交阶段：全部系统凭证、余额变动与一条批次审计记录在**同一个事务**
+             内落库，中途任何异常整批回滚，不会留下半批系统凭证。
+        因此失败后修好汇率重试，结果与一次成功完全一致（同日重估本就幂等）。
+
+        其它规则：
         * 只统计 ``voucher_date <= rate_date`` 的分录（后续期间业务不影响本次重估）；
-        * 汇率必须在 ``rate_date`` 当天存在（不用历史最近汇率），缺则报错；
-        * 某账户重估差额为 0 时跳过，所以同一汇率日可重复执行（幂等）；
-        * 目标期间须未关账；若该期间曾经关账，系统凭证自动标为调整凭证。
+        * 汇率必须在 ``rate_date`` 当天存在（不用历史最近汇率）；
+        * 差额为 0 的账户跳过；目标期间曾关账时系统凭证自动标为调整凭证。
         """
         _date.fromisoformat(rate_date)
         period = period_of(rate_date)
         prow = self._assert_period_open(period, rate_date)
         ever_closed = bool(prow["ever_closed"])
         _, fx_account = self._fx_config()
-        base_prec = self.base_precision
 
-        # 截至重估日的余额直接从分录聚合（Decimal，Python 侧求和），
-        # 不读全局 ledger_balance，以免把未来期间的凭证算进来。
+        # ---------- 阶段 1：只读预检 + 构建全部凭证（不产生任何写入）----------
+        agg = self._revalue_balances(rate_date, accounts)
+        plans: list[dict] = []
+        skips: list[dict] = []
+        posted_meta: list[dict] = []
+        for acct_code, x in sorted(agg.items()):
+            ccy = x["currency"]
+            fx_bal = x["fx"]
+            base_bal = x["base"]
+            if fx_bal == 0:
+                skips.append({"account": acct_code, "reason": "截至重估日外币余额为 0"})
+                continue
+            rate = self.get_rate(ccy, rate_date, exact=True)
+            if rate is None:
+                # 预检失败：本方法尚未执行任何 INSERT/UPDATE，调用方账本无残留
+                raise ValidationError(
+                    f"整批重估中止：账户 {acct_code}（{ccy}）在重估日 {rate_date} "
+                    "没有当天汇率；已取消本批全部重估凭证（无任何写入），补齐汇率后请重试"
+                )
+            target = convert(fx_bal, rate, self.base_precision)
+            diff = quantize(target - base_bal, self.base_precision)
+            if diff == 0:
+                skips.append(
+                    {"account": acct_code, "currency": ccy, "reason": "重估差额为 0，无需入账"}
+                )
+                continue
+
+            # 差额 >0：借外币账户 / 贷汇兑损益（收益）；<0 反向（损失）
+            if diff > 0:
+                fx_line = {"account": acct_code, "currency": ccy, "base_debit": str(diff)}
+                gl_line = {"account": fx_account, "currency": self.base_currency,
+                           "credit": str(diff)}
+            else:
+                fx_line = {"account": acct_code, "currency": ccy, "base_credit": str(-diff)}
+                gl_line = {"account": fx_account, "currency": self.base_currency,
+                           "debit": str(-diff)}
+            plan = self._prepare_voucher(
+                rate_date,
+                [fx_line, gl_line],
+                memo or f"期末汇率重估 {acct_code} @ {rate_date}（汇率 {rate}）",
+                is_adjustment=ever_closed,
+                _system=True,
+            )
+            plans.append(plan)
+            posted_meta.append(
+                {
+                    "account": acct_code,
+                    "currency": ccy,
+                    "fx_balance": str(fx_bal),
+                    "rate": str(rate),
+                    "revalued_base": str(target),
+                    "diff": str(diff),
+                    "is_adjustment": ever_closed,
+                }
+            )
+
+        if not plans:
+            # 全是跳过项：不产生系统凭证，也不产生批次审计记录（无可追踪的写入）
+            return {"date": rate_date, "period": period, "posted": [], "skipped": skips,
+                    "audit_id": None}
+
+        # 预分配系统凭证号，避免落库阶段再做计数查询
+        existing = self.conn.execute(
+            "SELECT COUNT(*) c FROM voucher WHERE period=? AND voucher_no LIKE ?",
+            (period, f"R-{period}-%"),
+        ).fetchone()["c"]
+        for i, plan in enumerate(plans, start=1):
+            plan["_voucher_no"] = f"R-{period}-{existing + i:04d}"
+
+        # ---------- 阶段 2：单事务提交整批 ----------
+        posted: list[dict] = []
+        try:
+            with self.conn:
+                for plan, meta in zip(plans, posted_meta):
+                    v = self._persist_voucher(plan, voucher_no=plan["_voucher_no"])
+                    posted.append({"voucher_no": v["voucher_no"], **meta})
+                audit_id = self._audit(
+                    "fx.revalue",
+                    period,
+                    {"date": rate_date, "posted": posted, "skipped": skips,
+                     "batch_size": len(posted)},
+                )
+        except Exception:
+            # with 块已回滚全部凭证/余额/审计；防御性确认无该批凭证残留
+            raise
+
+        return {"date": rate_date, "period": period, "posted": posted, "skipped": skips,
+                "audit_id": audit_id}
+
+    def _revalue_balances(self, rate_date: str, accounts: list[str] | None) -> dict[str, dict]:
+        """聚合截至重估日各外币账户的原币/本位币净额（Decimal，Python 侧求和）。"""
+        base_prec = self.base_precision
         sql = (
             "SELECT e.account account, a.name name, e.currency currency, "
             "e.debit dr, e.credit cr, e.base_debit bdr, e.base_credit bcr "
@@ -633,72 +791,9 @@ class Ledger:
             )
             x["fx"] += D(r["dr"]) - D(r["cr"])
             x["base"] += D(r["bdr"]) - D(r["bcr"])
-
-        skips: list[dict] = []
-        posted: list[dict] = []
-        for acct_code, x in sorted(agg.items()):
-            ccy = x["currency"]
-            fx_bal = x["fx"]
-            base_bal = x["base"]
-            if fx_bal == 0:
-                skips.append({"account": acct_code, "reason": "截至重估日外币余额为 0"})
-                continue
-            rate = self.get_rate(ccy, rate_date, exact=True)
-            if rate is None:
-                raise ValidationError(
-                    f"账户 {acct_code}（{ccy}）在重估日 {rate_date} 没有当天汇率，无法重估"
-                )
-            target = convert(fx_bal, rate, base_prec)
-            diff = quantize(target - base_bal, base_prec)
-            if diff == 0:
-                skips.append(
-                    {"account": acct_code, "currency": ccy, "reason": "重估差额为 0，无需入账"}
-                )
-                continue
-
-            # 差额 >0：借外币账户 / 贷汇兑损益（收益）；<0 反向（损失）
-            if diff > 0:
-                fx_line = {"account": acct_code, "currency": ccy, "base_debit": str(diff)}
-                gl_line = {
-                    "account": fx_account,
-                    "currency": self.base_currency,
-                    "credit": str(diff),
-                }
-            else:
-                fx_line = {"account": acct_code, "currency": ccy, "base_credit": str(-diff)}
-                gl_line = {
-                    "account": fx_account,
-                    "currency": self.base_currency,
-                    "debit": str(-diff),
-                }
-            v = self.post_voucher(
-                rate_date,
-                [fx_line, gl_line],
-                memo or f"期末汇率重估 {acct_code} @ {rate_date}（汇率 {rate}）",
-                is_adjustment=ever_closed,
-                _system=True,
-            )
-            posted.append(
-                {
-                    "voucher_no": v["voucher_no"],
-                    "account": acct_code,
-                    "currency": ccy,
-                    "fx_balance": str(fx_bal),
-                    "rate": str(rate),
-                    "revalued_base": str(target),
-                    "diff": str(diff),
-                    "is_adjustment": v["is_adjustment"],
-                }
-            )
-
-        with self.conn:
-            audit_id = self._audit(
-                "fx.revalue",
-                period,
-                {"date": rate_date, "posted": posted, "skipped": skips},
-            )
-        return {"date": rate_date, "period": period, "posted": posted, "skipped": skips,
-                "audit_id": audit_id}
+        for x in agg.values():
+            x["base"] = quantize(x["base"], base_prec)
+        return agg
 
     # ---------- 余额 / 试算 / 恒等式 ----------
 
@@ -964,6 +1059,11 @@ class Ledger:
             self.conn.execute(
                 "UPDATE period SET status='closed', ever_closed=1 WHERE code=?", (period,)
             )
+            self.conn.execute(
+                "INSERT INTO meta(key,value) VALUES('snapshot_head',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (snap_hash,),
+            )
             audit_id = self._audit(
                 "period.close",
                 period,
@@ -1083,6 +1183,24 @@ class Ledger:
             if h != r["hash"]:
                 raise ConsistencyError(f"审计记录 {r['id']}（{r['action']}）哈希不符")
             prev = r["hash"]
+        # 链头锚点：meta.audit_head 必须等于现存最后一条记录的哈希。
+        # 仅靠 prev_hash 链无法发现"最后一条被删"，锚点补上这个缺口。
+        anchor = self.conn.execute(
+            "SELECT value FROM meta WHERE key='audit_head'"
+        ).fetchone()
+        if rows:
+            if anchor is None:
+                raise ConsistencyError("审计链头锚点缺失，审计记录可能被删除")
+            if anchor["value"] != prev:
+                deleted = self.conn.execute(
+                    "SELECT id,action FROM audit_log WHERE hash=?", (anchor["value"],)
+                ).fetchone()
+                hint = "（锚点指向的记录不在库中，末条审计记录疑似被删除）" if deleted is None else ""
+                raise ConsistencyError(
+                    f"审计链头锚点与现存最后一条记录不符{hint}"
+                )
+        elif anchor is not None:
+            raise ConsistencyError("审计表为空但链头锚点仍存在，审计记录疑似被整体删除")
 
     def verify_snapshots(self) -> None:
         rows = self.conn.execute("SELECT * FROM period_snapshot ORDER BY id").fetchall()
@@ -1119,6 +1237,19 @@ class Ledger:
             if len(entries) != r["entry_count"]:
                 raise ConsistencyError(f"快照 {r['period']}#{r['generation']} 分录数不一致")
             prev = r["hash"]
+        # 快照链头锚点：与审计链同理，用于发现最后一代快照被删
+        anchor = self.conn.execute(
+            "SELECT value FROM meta WHERE key='snapshot_head'"
+        ).fetchone()
+        if rows:
+            if anchor is None:
+                raise ConsistencyError("快照链头锚点缺失，关账快照可能被删除")
+            if anchor["value"] != prev:
+                raise ConsistencyError(
+                    "快照链头锚点与现存最后一代快照不符（末代快照疑似被删除）"
+                )
+        elif anchor is not None:
+            raise ConsistencyError("快照表为空但链头锚点仍存在，快照疑似被整体删除")
 
     def verify_latest_snapshot_matches_books(self, period: str) -> dict:
         """再关账场景核对：指定期间最新一代快照必须与当前账上分录/余额完全一致。"""
